@@ -197,6 +197,30 @@ class FactorioNamespace:
             if not callable(getattr(self, attr)) and not attr.startswith("__")
         ]
 
+        # Protected names are frozen after tool loading (see _freeze_protected_names).
+        # Agent code that tries to define a function or variable with a protected name
+        # will get an error instead of silently shadowing an FLE tool/builtin.
+        self._protected_names = set()
+
+    def _freeze_protected_names(self):
+        """Snapshot all current namespace names as protected.
+
+        Called by FactorioInstance after tools are loaded. Any subsequent
+        attempt by agent code to define a function or variable with one
+        of these names will raise an error instead of silently overwriting.
+        """
+        self._protected_names = {
+            attr for attr in dir(self) if not attr.startswith("__")
+        }
+
+    def _check_protected(self, name: str):
+        """Raise if *name* would shadow a protected FLE name."""
+        if self._protected_names and name in self._protected_names:
+            raise NameError(
+                f"Cannot redefine '{name}' — it is a built-in FLE function/variable. "
+                f"Choose a different name."
+            )
+
     def get_functions(self) -> List[SerializableFunction]:
         """
         Gets all defined functions mapped from their attribute name in the namespace.
@@ -242,9 +266,26 @@ class FactorioNamespace:
 
     def reset(self):
         """
-        Delete all variables that have accrued in the namespace by the agent, except for preexisting members
+        Delete all variables that have accrued in the namespace by the agent, except for preexisting members.
+        Also reset internal state variables to ensure clean test isolation.
         @return:
         """
+        # Reset internal state variables that are in _static_members but should be cleared
+        self.logging_results = {}
+        self.log_counter = 0
+        self.line_value = 0
+        self.player_location = ent.Position(x=0, y=0)
+        self.loop_context = LoopContext()
+        self._sequential_exception_count = 0
+
+        # Clear agent-defined variables from persistent_vars, keeping only builtins
+        # Filter to only keep items that are in essential_builtins or are builtins
+        builtin_names = set(self.essential_builtins.keys()) | set(dir(builtins))
+        self.persistent_vars = {
+            k: v for k, v in self.persistent_vars.items() if k in builtin_names
+        }
+
+        # Clear agent-created attributes (non-callable, non-private, non-static)
         for attr in dir(self):
             if (
                 not callable(getattr(self, attr))
@@ -348,8 +389,13 @@ class FactorioNamespace:
             for subnode_idx, subnode in enumerate(node.orelse):
                 node.orelse[subnode_idx] = self._change_print_to_log(subnode)
         elif isinstance(node, ast.FunctionDef):
-            for subnode_idx, subnode in enumerate(node.body):
-                node.body[subnode_idx] = self._change_print_to_log(subnode)
+            # Don't rewrite print→log inside function bodies.
+            # SerializableFunction.reconstruct() injects print=instance.log
+            # into the function's globals, so print() calls inside agent-defined
+            # functions are routed to the log automatically at call time.
+            # Rewriting here would cause infinite recursion when agents define
+            # their own helper named 'log' that calls print().
+            pass
         return node
 
     def execute_body(self, body, eval_dict, parent_node=None):
@@ -518,6 +564,7 @@ class FactorioNamespace:
             return True
 
         elif isinstance(node, ast.FunctionDef):
+            self._check_protected(node.name)
             try:
                 # Process return type annotation if present
                 return_annotation = (
@@ -576,9 +623,10 @@ class FactorioNamespace:
                 compiled = compile(wrapped_node, "file", "exec")
                 exec(
                     compiled, function_namespace, eval_dict
-                )  # Pass eval_dict as globals
+                )  # Pass eval_dict as locals
 
-                func = function_namespace[node.name]
+                # The new function is stored in eval_dict (locals), not function_namespace (globals)
+                func = eval_dict[node.name]
 
                 if hasattr(node, "__annotations__"):
                     func.__annotations__ = getattr(node, "__annotations__")
@@ -603,6 +651,11 @@ class FactorioNamespace:
                 return True
 
         elif isinstance(node, ast.Assign):
+            # Check if any explicit targets would shadow protected names
+            for t in node.targets:
+                if isinstance(t, ast.Name):
+                    self._check_protected(t.id)
+
             # Get the original eval_dict keys before execution
             original_keys = set(eval_dict.keys())
 
@@ -631,6 +684,8 @@ class FactorioNamespace:
             return True
 
         elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                self._check_protected(node.target.id)
             if node.value:
                 compiled = compile(ast.Module([node], type_ignores=[]), "file", "exec")
                 exec(compiled, eval_dict)
@@ -646,6 +701,8 @@ class FactorioNamespace:
             return True
 
         elif isinstance(node, ast.AugAssign):
+            if isinstance(node.target, ast.Name):
+                self._check_protected(node.target.id)
             # Handle augmented assignments (+=, -=, *=, /=, //=, %=, **=, &=, |=, ^=, >>=, <<=)
             compiled = compile(ast.Module([node], type_ignores=[]), "file", "exec")
             exec(compiled, eval_dict)
@@ -998,7 +1055,7 @@ class FactorioNamespace:
         Supports try-except blocks, type annotations, and nested control flows.
         """
 
-        def parse_result_into_str(data, max_lines=64):
+        def parse_result_into_str(data, max_lines=512):
             result = []
             for key, values in data.items():
                 if self.execution_trace:
@@ -1008,9 +1065,8 @@ class FactorioNamespace:
                     for value in values:
                         result.append(f"{key}: {value}")
             if len(result) > max_lines:
-                result = [f"{len(result) - max_lines} lines truncated..."] + result[
-                    max_lines:
-                ]
+                truncated = len(result) - max_lines
+                result = result[:max_lines] + [f"... {truncated} lines truncated"]
 
             return "\n".join(result)
 
@@ -1066,7 +1122,7 @@ class FactorioNamespace:
                     break
 
                 last_successful_state = dict(self.persistent_vars)
-            except (Exception, NameError) as e:
+            except (Exception, NameError, SystemExit) as e:
                 self._sequential_exception_count += 1
                 error_traceback = traceback.format_exc()
                 error_lines = self._extract_error_lines(expr, error_traceback)
@@ -1109,13 +1165,13 @@ class FactorioNamespace:
                 if isinstance(value, SerializableFunction):
                     eval_dict[key] = value.bind(self)
 
-        score, goal = self.score()
+        score, automated_score = self.score()
         result_output = parse_result_into_str(self.logging_results)
 
         # if had_error:
         # raise Exception(result_output)
 
-        return score, goal, result_output
+        return score, automated_score, result_output
 
     def get_messages(self) -> List[Dict]:
         return []

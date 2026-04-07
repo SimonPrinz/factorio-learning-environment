@@ -1,0 +1,11 @@
+-- Factorio 2.0 direction passthrough.
+-- This file was originally created to convert Factorio 2.0 direction values,
+-- but we've decided to keep the raw Factorio values (0,4,8,12) in Python
+-- to maintain consistency. This file is kept as a placeholder in case we
+-- need direction-related fixes in the future.
+--
+-- The Python Direction enum uses the same values as Factorio 2.0:
+-- UP=0, RIGHT=4, DOWN=8, LEFT=12
+
+-- Note: No modifications to serialize_entity are needed.
+-- Factorio 2.0 direction values pass through directly to Python.
